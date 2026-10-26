@@ -1,0 +1,41 @@
+services:
+  gateway:
+    build:
+      context: .
+      args:
+        # 国内机器可换成镜像加速地址，例如：
+        #   NODE_IMAGE=registry.cn-hangzhou.aliyuncs.com/library/node:22-bookworm-slim
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-bookworm-slim}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org}
+    image: cmcc-gateway-node:1.0.0
+    container_name: cmcc-gateway
+    restart: unless-stopped
+    # 实测占用 25~40MB，限制 256MB 防止内存泄漏影响同机其他服务
+    mem_limit: 256m
+    memswap_limit: 256m
+    # 只监听自定义端口，80/443 留给上层 nginx / 宝塔反代
+    ports:
+      - "18090:8080"
+    env_file:
+      - .env
+    environment:
+      PORT: "8080"
+      DATA_DIR: /data
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8080/health').then(()=>process.exit(0)).catch(()=>process.exit(1))
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
