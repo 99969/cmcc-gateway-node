@@ -1,18 +1,46 @@
 /**
- * GET 推送幂等去重。
+ * 推送幂等去重（带回放）。
  *
- * 现象：域名套了 CDN（EdgeOne / 云 CDN）后，一次 GET 推送用户收到两条。
- * 原因：GET 在 HTTP 语义里是幂等的，CDN 会在源站响应慢（本服务要等主链路
- * WebSocket 返回，通常 1~3s）时重试同一个 GET；或 http→https / 裸域→www
- * 的 301/302 跟随导致同一请求回源两次。本服务的 GET 有副作用（真的发消息），
- * 因此必须在入口按「令牌 + 内容」做幂等。
+ * 背景：域名套 CDN 后，CDN 在源站响应慢时会重试同一个 GET，或 301/302 跟随
+ * 导致同一请求回源两次。GET 在 HTTP 语义里幂等，但本服务的 GET 会真的发消息。
  *
- * 策略：窗口内内容完全相同的 GET 只投递第一次，其余直接返回成功但不投递，
- * 让 CDN / 调用方停止重试。窗口用 DEDUP_WINDOW_MS 配置，默认 5000ms，
- * 设 0 关闭（不再去重）。需要连发两条一模一样的内容时，URL 加 ?dedup=0 绕过。
+ * 需要同时满足两点：
+ *  1) 同一条消息只投递一次；
+ *  2) 重复请求要返回**第一次的真实投递结果**（channel_only / messageId），
+ *     而不是一个「已忽略」的模糊响应。否则 CDN 把重试那次的响应回给客户端时，
+ *     调用方看到 duplicate 会误以为没发出去。
+ *
+ * 幂等键（永不为 null/undefined）：
+ *  - 客户端显式传了 messageId → `${token}\0id\0${messageId}`
+ *  - 否则内容指纹 → `${token}\0h\0${sha1(kind\0title\0body)}`
+ *  always 带 token，避免不同令牌发相同内容被互相吞掉。
+ *
+ * 窗口默认 5000ms（覆盖 CDN 重试），DEDUP_WINDOW_MS 可配，0 关闭；
+ * ?dedup=0 或 X-Dedup: 0 可单次绕过。
  */
+import { createHash } from "node:crypto";
+
+export interface CachedResult {
+  status: number;
+  body: string;
+  contentType: string;
+}
+
+export type DedupDecision =
+  /** 首次出现：正常投递，随后调用 finish() 记录结果 */
+  | { duplicate: false; key: string }
+  /** 重复：首次结果已知，直接重放 */
+  | { duplicate: true; key: string; cached: CachedResult }
+  /** 重复：首次仍在投递中，暂无结果 */
+  | { duplicate: true; key: string; cached: null };
+
+interface Entry {
+  ts: number;
+  result?: CachedResult;
+}
+
 export class PushDeduplicator {
-  private readonly hits = new Map<string, number>();
+  private readonly hits = new Map<string, Entry>();
   private readonly windowMs: number;
   private readonly enabled: boolean;
   private readonly maxEntries = 5000;
@@ -22,27 +50,46 @@ export class PushDeduplicator {
     const raw =
       windowMs === undefined || windowMs === "" ? 5000 : Number(windowMs);
     this.enabled = Number.isFinite(raw) && raw > 0;
+    // 上限 60s：再长会把「正常的一分钟内重复通知」误判
     this.windowMs = this.enabled ? Math.min(60_000, Math.max(200, raw)) : 0;
   }
 
-  /** 返回 true = 窗口内的重复请求，调用方应跳过投递 */
-  isDuplicate(key: string, now = Date.now()): boolean {
-    if (!this.enabled) return false;
+  /** 判断是否重复；首次出现时立即占位，避免并发双发同时放行 */
+  begin(key: string, now = Date.now()): DedupDecision {
+    if (!this.enabled) return { duplicate: false, key };
     const previous = this.hits.get(key);
-    if (previous !== undefined && now - previous < this.windowMs) {
-      return true;
+    if (previous !== undefined && now - previous.ts < this.windowMs) {
+      return { duplicate: true, key, cached: previous.result ?? null };
     }
-    this.hits.set(key, now);
+    this.hits.set(key, { ts: now });
     this.sweep(now);
-    return false;
+    return { duplicate: false, key };
   }
 
-  /** 定期清理过期项，防止 Map 无限增长 */
+  /** 首次投递完成后记录真实结果，供后续重复请求重放 */
+  finish(key: string, result: CachedResult, now = Date.now()): void {
+    if (!this.enabled) return;
+    const entry = this.hits.get(key);
+    if (entry === undefined || now - entry.ts >= this.windowMs) {
+      this.hits.set(key, { ts: now, result });
+      return;
+    }
+    entry.result = result;
+  }
+
+  /** 读取窗口内已记录的结果（用于「等首次完成后重放」） */
+  peek(key: string, now = Date.now()): CachedResult | null {
+    if (!this.enabled) return null;
+    const entry = this.hits.get(key);
+    if (entry === undefined || now - entry.ts >= this.windowMs) return null;
+    return entry.result ?? null;
+  }
+
   private sweep(now: number): void {
     if (now - this.lastSweep < this.windowMs) return;
     this.lastSweep = now;
-    for (const [key, ts] of this.hits) {
-      if (now - ts >= this.windowMs) this.hits.delete(key);
+    for (const [key, entry] of this.hits) {
+      if (now - entry.ts >= this.windowMs) this.hits.delete(key);
     }
     if (this.hits.size > this.maxEntries) {
       let drop = this.hits.size - this.maxEntries;
@@ -53,12 +100,22 @@ export class PushDeduplicator {
     }
   }
 
+  /**
+   * 生成幂等键。绝不为空：没有 messageId 时退化为内容指纹。
+   */
   static key(
     tokenScope: string,
     kind: string,
     title: string,
     body: string,
+    messageId?: string | null,
   ): string {
-    return `${tokenScope}\u0000${kind}\u0000${title}\u0000${body}`;
+    const scope = tokenScope || "anon";
+    const id = (messageId || "").trim();
+    if (id) return `${scope}\u0000id\u0000${id}`;
+    const fingerprint = createHash("sha1")
+      .update(`${kind}\u0000${title}\u0000${body}`, "utf8")
+      .digest("hex");
+    return `${scope}\u0000h\u0000${fingerprint}`;
   }
 }

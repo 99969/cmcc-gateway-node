@@ -187,29 +187,69 @@ export function createApp(
     }
 
     // GET 推送幂等去重：CDN（EdgeOne 等）在源站响应慢时会重试同一 GET，
-    // 或 301/302 跟随导致回源两次。窗口内「同令牌 + 同内容」只投递第一次，
-    // 其余返回成功让调用方停止重试。?dedup=0 可显式关闭（连发相同内容时用）。
+    // 或 301/302 跟随导致回源两次。窗口内「同令牌 + 同内容」只投递第一次；
+    // 重复请求**重放第一次的真实结果**（channel_only / messageId），
+    // 而不是回一个模糊的 duplicate，否则调用方会误判成没发出去。
+    // ?dedup=0 / X-Dedup: 0 可单次关闭（确需连发相同内容时）。
     const requestUrl = new URL(request.url);
     const dedupOff =
       requestUrl.searchParams.get("dedup") === "0" ||
       request.headers.get("x-dedup") === "0";
+    let dedupKey: string | null = null;
     if (push && !dedupOff) {
       const scope = tokenId || tokenName || accountId;
-      const key = PushDeduplicator.key(
+      const messageId =
+        requestUrl.searchParams.get("messageId") ||
+        requestUrl.searchParams.get("message_id") ||
+        request.headers.get("x-message-id");
+      dedupKey = PushDeduplicator.key(
         scope,
         info.kind,
         info.title,
         info.body,
+        messageId,
       );
-      if (deduper.isDuplicate(key)) {
+      const decision = deduper.begin(dedupKey);
+      if (decision.duplicate) {
+        if (decision.cached) {
+          // 重放首次真实响应，调用方看到的结果与第一次完全一致
+          return new Response(decision.cached.body, {
+            status: decision.cached.status,
+            headers: {
+              "content-type": decision.cached.contentType,
+              "cache-control": "no-store",
+              "x-idempotent-replay": "1",
+            },
+          });
+        }
+        // 首次仍在投递中：短暂等它完成（CDN 双回源常几乎同时到达），
+        // 拿到真实结果就重放，避免调用方误判。
+        const sleeper = (ms: number): Promise<void> =>
+          new Promise((resolve) => setTimeout(resolve, ms));
+        for (let i = 0; i < 20; i += 1) {
+          const ready = deduper.peek(dedupKey);
+          if (ready) {
+            return new Response(ready.body, {
+              status: ready.status,
+              headers: {
+                "content-type": ready.contentType,
+                "cache-control": "no-store",
+                "x-idempotent-replay": "1",
+              },
+            });
+          }
+          await sleeper(50);
+        }
+        // 仍无结果：明确告知「已合并」，不再重复投递
         return json(
           {
             ok: true,
-            code: 200,
-            message: "重复推送，已按幂等去重忽略",
-            data: { status: "duplicate", messageId: null },
+            code: 202,
+            message: "同一消息正在投递中，本次重复请求已合并",
+            data: { status: "in_flight", messageId: null },
           },
-          200,
+          202,
+          { "x-idempotent-replay": "1" },
         );
       }
     }
@@ -240,6 +280,23 @@ export function createApp(
       });
     };
 
+    // 记录本次真实响应，供窗口内的重复请求重放
+    const remember = async (response: Response): Promise<void> => {
+      if (!dedupKey) return;
+      try {
+        const body = await response.clone().text();
+        deduper.finish(dedupKey, {
+          status: response.status,
+          body,
+          contentType:
+            response.headers.get("content-type") ||
+            "application/json; charset=utf-8",
+        });
+      } catch {
+        // 记录失败不影响响应
+      }
+    };
+
     if (isAsync) {
       const forward = request.clone() as unknown as Request;
       wait(
@@ -255,10 +312,11 @@ export function createApp(
           } else {
             inner = await gateway.fetch(forward);
           }
+          await remember(inner);
           await runFanout(inner);
         })(),
       );
-      return json(
+      const queued = json(
         {
           ok: true,
           code: 202,
@@ -267,6 +325,8 @@ export function createApp(
         },
         202,
       );
+      await remember(queued);
+      return queued;
     }
 
     const skip: string[] = [];
@@ -305,6 +365,7 @@ export function createApp(
       }),
     );
 
+    await remember(response);
     return response;
   }
 
