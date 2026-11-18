@@ -18,6 +18,8 @@ export interface Bindings {
   INBOUND_WEBHOOK_TOKEN?: string;
   /** 对外访问地址（反代后必须设置，用于 GitHub OAuth 回调） */
   BASE_URL?: string;
+  /** GET 推送幂等去重窗口（毫秒），0 = 关闭；默认 5000 */
+  DEDUP_WINDOW_MS?: string;
   /** 运行时注入：账号 → 网关实例（替代 Cloudflare 的 DurableObjectNamespace） */
   registry?: {
     get(accountId: string): Promise<{

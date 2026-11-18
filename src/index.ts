@@ -24,6 +24,7 @@ function readBindings(): Bindings {
     GITHUB_CLIENT_SECRET: process.env.GITHUB_CLIENT_SECRET || "",
     GITHUB_ADMIN_LOGINS: process.env.GITHUB_ADMIN_LOGINS || "",
     BASE_URL: process.env.BASE_URL || "",
+    DEDUP_WINDOW_MS: process.env.DEDUP_WINDOW_MS || "",
   };
 }
 

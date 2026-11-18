@@ -11,6 +11,7 @@ import {
   listChannels,
 } from "./admin/store.js";
 import { CmccGateway } from "./cmcc-gateway.js";
+import { PushDeduplicator } from "./dedupe.js";
 import type { Bindings, HonoEnv } from "./env.js";
 import { errorMessage, getAuthToken, json } from "./http.js";
 import { VERSION } from "./version.js";
@@ -54,6 +55,8 @@ export function createApp(
 ): AppBundle {
   const registry = new GatewayRegistry(bindings, db);
   const env: Bindings = { ...bindings, DB: db, registry };
+  // GET 推送幂等：CDN 回源重试 / 301 跟随导致同一条消息到达两次，这里去重
+  const deduper = new PushDeduplicator(bindings.DEDUP_WINDOW_MS);
 
   /** 令牌没指定账号、或指定的账号不存在/停用时，退回最近连通过的启用账号 */
   async function resolveAccountId(preferred?: string | null): Promise<string> {
@@ -181,6 +184,34 @@ export function createApp(
     // 空消息直接拒绝，不投递任何地方
     if (!info.title && !info.body) {
       return json({ ok: false, code: 400, message: "消息内容不能为空" }, 400);
+    }
+
+    // GET 推送幂等去重：CDN（EdgeOne 等）在源站响应慢时会重试同一 GET，
+    // 或 301/302 跟随导致回源两次。窗口内「同令牌 + 同内容」只投递第一次，
+    // 其余返回成功让调用方停止重试。?dedup=0 可显式关闭（连发相同内容时用）。
+    const requestUrl = new URL(request.url);
+    const dedupOff =
+      requestUrl.searchParams.get("dedup") === "0" ||
+      request.headers.get("x-dedup") === "0";
+    if (push && !dedupOff) {
+      const scope = tokenId || tokenName || accountId;
+      const key = PushDeduplicator.key(
+        scope,
+        info.kind,
+        info.title,
+        info.body,
+      );
+      if (deduper.isDuplicate(key)) {
+        return json(
+          {
+            ok: true,
+            code: 200,
+            message: "重复推送，已按幂等去重忽略",
+            data: { status: "duplicate", messageId: null },
+          },
+          200,
+        );
+      }
     }
 
     let allowed: string[] | null = null;
