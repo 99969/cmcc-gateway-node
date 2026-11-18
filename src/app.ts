@@ -195,19 +195,25 @@ export function createApp(
     const dedupOff =
       requestUrl.searchParams.get("dedup") === "0" ||
       request.headers.get("x-dedup") === "0";
+    const explicitMessageId =
+      requestUrl.searchParams.get("messageId") ||
+      requestUrl.searchParams.get("message_id") ||
+      request.headers.get("x-message-id") ||
+      "";
+    // 只对 GET 去重（CDN 只会重试幂等的 GET）；POST 不是幂等语义、CDN 不重试，
+    // 除非调用方显式带 messageId 才参与去重，避免误伤生产的 POST 通知。
+    const dedupEnabled =
+      !dedupOff &&
+      (request.method.toUpperCase() === "GET" || Boolean(explicitMessageId));
     let dedupKey: string | null = null;
-    if (push && !dedupOff) {
+    if (push && dedupEnabled) {
       const scope = tokenId || tokenName || accountId;
-      const messageId =
-        requestUrl.searchParams.get("messageId") ||
-        requestUrl.searchParams.get("message_id") ||
-        request.headers.get("x-message-id");
       dedupKey = PushDeduplicator.key(
         scope,
         info.kind,
         info.title,
         info.body,
-        messageId,
+        explicitMessageId,
       );
       const decision = deduper.begin(dedupKey);
       if (decision.duplicate) {
